@@ -108,6 +108,6 @@ setInterval(() => {
   console.log('⏱️ Scheduled auto-restart...');
   recordRestart(false);
   process.exit(0);
-}, 20 * 60 * 1000); // 20 minutes
+}, 10 * 60 * 1000); // 20 minutes
 
 client.login(process.env.TOKEN);
