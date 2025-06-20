@@ -1,138 +1,140 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, SlashCommandBuilder, REST, Routes, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
+const path = require('path');
 
+// ──────── CONFIG ────────
+const token = process.env.TOKEN;
+const devIds = process.env.DEV_USER_IDS.split(',');
+const restartRoleId = process.env.RESTART_ROLE_ID;
+const startupFile = process.env.STARTUP_TIMESTAMP_FILE || './uptime.json';
+let restartMessageInfo = null;
+
+// ──────── DISCORD CLIENT ────────
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
   partials: [Partials.Channel]
 });
 
-const RESTART_FILE = './last-restart.json';
-let wasManualRestart = false;
-const devs = process.env.DEV_USER_IDS.split(',');
-
-function recordRestart(manual = false, reason = '') {
-  fs.writeFileSync(RESTART_FILE, JSON.stringify({
-    timestamp: Date.now(),
-    manual,
-    reason
+// ──────── SAVE STARTUP TIMESTAMP ────────
+function updateStartupTime() {
+  fs.writeFileSync(startupFile, JSON.stringify({
+    timestamp: Date.now()
   }));
 }
 
-function getLastRestartInfo() {
-  if (!fs.existsSync(RESTART_FILE)) return null;
+function getUptimeSeconds() {
   try {
-    const data = JSON.parse(fs.readFileSync(RESTART_FILE));
-    wasManualRestart = data.manual || false;
-    return data;
+    const data = JSON.parse(fs.readFileSync(startupFile));
+    return Math.floor((Date.now() - data.timestamp) / 1000);
   } catch {
-    return null;
+    return 0;
   }
 }
 
-// Uptime tracking
-let lastOnlineTimestamp = Date.now();
-const onlineSinceFile = './online-since.txt';
-if (fs.existsSync(onlineSinceFile)) {
-  const stored = parseInt(fs.readFileSync(onlineSinceFile, 'utf-8'));
-  if (!isNaN(stored)) lastOnlineTimestamp = stored;
-}
-fs.writeFileSync(onlineSinceFile, Date.now().toString());
-
-// ──────── Ready ────────
-client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-
-  const restartInfo = getLastRestartInfo();
-  const restartMsg = restartInfo?.manual ? '🔁 Manual restart.' : '⚠️ Auto or crash restart.';
-  const restartTime = `<t:${Math.floor(Date.now() / 1000)}:F>`;
-
-  for (const devId of devs) {
-    try {
-      const user = await client.users.fetch(devId.trim());
-      await user.send(`${restartMsg}\n⏱️ Restarted at: ${restartTime}`);
-    } catch (e) {
-      console.warn(`❌ Couldn't DM ${devId}`);
+// ──────── ERROR HANDLER ────────
+process.on('unhandledRejection', async (err) => {
+  console.error('💥 Unhandled Rejection:', err);
+  for (const id of devIds) {
+    const user = await client.users.fetch(id).catch(() => null);
+    if (user) {
+      user.send(`❌ **Unhandled error**:\n\`\`\`${err.stack || err.message || err}\`\`\``).catch(() => null);
     }
   }
-
-  recordRestart(false);
 });
 
-// ──────── Slash Commands ────────
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+// ──────── SLASH COMMANDS ────────
+client.once('ready', async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  updateStartupTime();
+
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('uptime')
+      .setDescription('Show how long the bot has been running'),
+    new SlashCommandBuilder()
+      .setName('restart')
+      .setDescription('Manually restart the bot (CPRO+ only)')
+  ].map(cmd => cmd.toJSON());
+
+  const rest = new REST({ version: '10' }).setToken(token);
+  try {
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log('✅ Slash commands registered.');
+  } catch (err) {
+    console.error('❌ Failed to register commands', err);
+  }
+
+  // Scheduled restart every 5 mins
+  scheduleRestartLoop();
+});
+
+// ──────── INTERACTIONS ────────
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isCommand()) return;
 
   if (interaction.commandName === 'uptime') {
-    const uptimeMs = Date.now() - lastOnlineTimestamp;
-    const hours = Math.floor(uptimeMs / 3600000);
-    const minutes = Math.floor((uptimeMs % 3600000) / 60000);
-    const seconds = Math.floor((uptimeMs % 60000) / 1000);
-
+    const uptime = getUptimeSeconds();
     const embed = new EmbedBuilder()
-      .setTitle('📈 Bot Uptime')
-      .setColor('Green')
+      .setTitle('📊 Bot Uptime')
       .addFields(
-        { name: 'Bot Name', value: client.user.tag, inline: true },
-        { name: 'Developers', value: devs.map(id => `<@${id.trim()}>`).join(', '), inline: true },
-        { name: 'Online Since', value: `<t:${Math.floor(lastOnlineTimestamp / 1000)}:F>`, inline: false },
-        { name: 'Uptime', value: `${hours}h ${minutes}m ${seconds}s`, inline: false }
-      );
-
+        { name: 'Bot Name', value: client.user.username, inline: true },
+        { name: 'Created By', value: devIds.map(id => `<@${id}>`).join(', '), inline: true },
+        { name: 'Uptime', value: `<t:${Math.floor((Date.now() - uptime * 1000) / 1000)}:R>`, inline: false }
+      )
+      .setColor('Green')
+      .setTimestamp();
     await interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
-  if (interaction.commandName === 'restart') {
-    const member = interaction.guild?.members.cache.get(interaction.user.id);
+  else if (interaction.commandName === 'restart') {
+    const member = interaction.member;
+    const isDM = !member;
+    const hasPermission = isDM || (member.roles.highest?.position >= interaction.guild.roles.cache.get(restartRoleId)?.position);
+    
+    if (!hasPermission) return interaction.reply({ content: '🚫 You do not have permission to restart the bot.', ephemeral: true });
 
-    if (interaction.guild && member) {
-      const targetRole = interaction.guild.roles.cache.find(role => role.name.toLowerCase() === 'chief public relations officer');
-      if (!targetRole || member.roles.highest.position < targetRole.position) {
-        return interaction.reply({ content: '❌ You do not have permission to use this command.', ephemeral: true });
-      }
+    await interaction.reply('🔄 Restarting...');
+    restartMessageInfo = {
+      channelId: interaction.channelId,
+      messageId: (await interaction.fetchReply()).id
+    };
+
+    for (const id of devIds) {
+      const user = await client.users.fetch(id).catch(() => null);
+      if (user) user.send(`🔁 Manual restart initiated by ${interaction.user.tag}`).catch(() => null);
     }
 
-    const embed = new EmbedBuilder()
-      .setTitle('♻️ Restarting...')
-      .setDescription('The bot is now restarting. Please wait a few seconds.')
-      .setColor('Yellow');
-
-    await interaction.reply({ embeds: [embed] });
-    recordRestart(true, 'Manual');
-
-    for (const devId of devs) {
-      try {
-        const user = await client.users.fetch(devId.trim());
-        await user.send(`🔁 Manual restart was triggered by <@${interaction.user.id}>.`);
-      } catch {}
-    }
-
-    setTimeout(() => {
-      process.exit(0);
-    }, 1000);
+    process.exit(0);
   }
 });
 
-// ──────── Register Slash Commands ────────
-const commands = [
-  new SlashCommandBuilder().setName('uptime').setDescription('Shows the bot uptime and stats'),
-  new SlashCommandBuilder().setName('restart').setDescription('Restarts the bot (authorized roles only)')
-];
-
-const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
-(async () => {
-  try {
-    console.log('🔁 Registering slash commands...');
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
-    console.log('✅ Slash commands registered.');
-  } catch (e) {
-    console.error(e);
+// ──────── RESTART CONFIRMATION ────────
+client.on('ready', async () => {
+  if (restartMessageInfo) {
+    const channel = await client.channels.fetch(restartMessageInfo.channelId).catch(() => null);
+    const msg = channel && await channel.messages.fetch(restartMessageInfo.messageId).catch(() => null);
+    if (msg) msg.edit('✅ Successfully restarted.');
+    restartMessageInfo = null;
   }
-})();
+});
 
-client.login(process.env.TOKEN);
+// ──────── SCHEDULED RESTART ────────
+function scheduleRestartLoop() {
+  setInterval(() => {
+    const now = new Date();
+    const minutes = now.getMinutes();
+    const seconds = now.getSeconds();
+
+    if (minutes % 5 === 0 && seconds < 5) {
+      console.log('⏰ Scheduled restart now.');
+      devIds.forEach(async id => {
+        const user = await client.users.fetch(id).catch(() => null);
+        if (user) user.send('♻️ Scheduled restart triggered.').catch(() => null);
+      });
+      process.exit(0);
+    }
+  }, 1000);
+}
+
+client.login(token);
