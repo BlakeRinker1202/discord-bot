@@ -5,9 +5,8 @@ const fs = require('fs');
 const app = express();
 
 const RESTART_FILE = './last-restart.json';
-let restartMessageId = null;
 
-// ──────── EXPRESS SERVER ────────
+// ──────── EXPRESS ────────
 app.get('/', (req, res) => {
   res.status(200).send('✅ Bot is running');
 });
@@ -15,7 +14,7 @@ app.listen(process.env.PORT || 3000, () => {
   console.log('🌐 Web server is running on port 3000');
 });
 
-// ──────── DISCORD BOT CLIENT ────────
+// ──────── CLIENT ────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -25,20 +24,19 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// ──────── RECORD RESTART INFO ────────
-function recordRestart(manual = false, messageData = null) {
+// ──────── RECORD RESTART ────────
+function recordRestart(type = 'crash', messageData = null) {
   fs.writeFileSync(RESTART_FILE, JSON.stringify({
     timestamp: Date.now(),
-    manual: manual,
-    messageData: messageData
+    type: type, // manual, crash, scheduled
+    messageData
   }));
 }
 
 function getLastRestartInfo() {
   if (!fs.existsSync(RESTART_FILE)) return null;
   try {
-    const data = JSON.parse(fs.readFileSync(RESTART_FILE));
-    return data;
+    return JSON.parse(fs.readFileSync(RESTART_FILE));
   } catch {
     return null;
   }
@@ -47,43 +45,44 @@ function getLastRestartInfo() {
 // ──────── BOT READY ────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-
   const restartInfo = getLastRestartInfo();
   const devIDs = process.env.DEV_USER_IDS?.split(',') || [];
+
+  const restartReason = {
+    manual: '🔁 Bot was manually restarted.',
+    crash: '⚠️ Bot restarted due to a crash.',
+    scheduled: '⏱️ Bot auto-restarted (scheduled).'
+  }[restartInfo?.type || 'crash'];
 
   for (const id of devIDs) {
     try {
       const user = await client.users.fetch(id.trim());
-      const message = restartInfo?.manual
-        ? '🔁 Bot was manually restarted.'
-        : '⚠️ Bot restarted due to a crash or deployment.';
-      await user.send(`${message}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
+      await user.send(`${restartReason}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
     } catch (err) {
       console.error(`❌ Failed to DM dev ${id}:`, err.message);
     }
   }
 
-  // Edit the old restart message if available
-  if (restartInfo?.messageData) {
+  if (restartInfo?.type === 'manual' && restartInfo.messageData) {
     try {
       const { channelId, messageId } = restartInfo.messageData;
       const channel = await client.channels.fetch(channelId);
       const msg = await channel.messages.fetch(messageId);
       if (msg) await msg.edit('✅ Successfully restarted.');
     } catch (err) {
-      console.error('⚠️ Failed to edit restart message:', err.message);
+      console.warn('⚠️ Could not edit restart message.');
     }
   }
 
-  // Assume crash/restart unless marked otherwise
-  recordRestart(false);
+  // Assume crash if not marked later
+  recordRestart('crash');
 
-  // 🔁 Schedule automatic restarts every 5 minutes (300,000ms)
-  setInterval(() => {
-    console.log('🕒 Auto-restarting...');
-    recordRestart(true); // Not manual, but we want to mark it before shutdown
+  // 🔁 Scheduled restart every 5 minutes
+  setTimeout(() => {
+    console.log('🕒 Scheduled auto-restart...');
+    recordRestart('scheduled');
     process.exit(0);
-  }, 10 * 60 * 1000);
+  }, 5 * 60 * 1000);
 });
 
 // ──────── RESTART COMMAND ────────
@@ -93,7 +92,7 @@ client.on('messageCreate', async msg => {
     if (!devIDs.includes(msg.author.id)) return;
 
     const reply = await msg.reply('🔄 Restarting now...');
-    recordRestart(true, {
+    recordRestart('manual', {
       channelId: reply.channel.id,
       messageId: reply.id
     });
@@ -102,15 +101,15 @@ client.on('messageCreate', async msg => {
   }
 });
 
-// ──────── ERROR HANDLING ────────
+// ──────── ERROR HANDLERS ────────
 process.on('uncaughtException', err => {
   console.error('💥 Uncaught Exception:', err);
-  recordRestart(false);
+  recordRestart('crash');
   process.exit(1);
 });
 process.on('unhandledRejection', reason => {
   console.error('💥 Unhandled Rejection:', reason);
-  recordRestart(false);
+  recordRestart('crash');
   process.exit(1);
 });
 
