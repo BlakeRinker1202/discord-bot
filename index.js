@@ -1,140 +1,104 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
-const express = require('express');
+const { Client, GatewayIntentBits, Partials, REST, Routes, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
-
-const app = express();
-app.get('/', (req, res) => res.send('✅ Bot is running'));
-app.listen(process.env.PORT || 3000, () => {
-  console.log(`🌐 Web server is running`);
-});
+const path = require('path');
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ],
-  partials: [Partials.Channel]
+  intents: [GatewayIntentBits.Guilds],
+  partials: [Partials.Channel],
 });
 
-// ──────── CONFIG ────────
-const RESTART_FILE = './last-restart.json';
-const UPTIME_FILE = './uptime.json';
-const DEV_USER_IDS = process.env.DEV_USER_IDS.split(',').map(id => id.trim());
+const DEV_USER_IDS = process.env.DEV_USER_IDS.split(','); // comma-separated in .env
+const UPTIME_FILE = path.join(__dirname, 'uptime.json');
+let launchTime = Date.now();
+let isRestart = false;
 
-// ──────── UPTIME TRACKING ────────
-let startTimestamp = Date.now();
-function getStoredUptime() {
-  if (fs.existsSync(UPTIME_FILE)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(UPTIME_FILE));
-      return data.timestamp || Date.now();
-    } catch {
-      return Date.now();
-    }
-  }
-  return Date.now();
-}
-function saveUptime() {
-  fs.writeFileSync(UPTIME_FILE, JSON.stringify({ timestamp: startTimestamp }));
-}
-
-// ──────── RESTART LOGIC ────────
-function recordRestart(manual = false, scheduled = false) {
-  fs.writeFileSync(RESTART_FILE, JSON.stringify({
-    timestamp: Date.now(),
-    manual,
-    scheduled
-  }));
-}
-function getLastRestartInfo() {
-  if (!fs.existsSync(RESTART_FILE)) return null;
+// Read last startup time
+function loadUptimeData() {
+  if (!fs.existsSync(UPTIME_FILE)) return null;
   try {
-    return JSON.parse(fs.readFileSync(RESTART_FILE));
+    return JSON.parse(fs.readFileSync(UPTIME_FILE));
   } catch {
     return null;
   }
 }
 
-// ──────── READY ────────
+// Save new startup time
+function saveUptimeData(timestamp) {
+  fs.writeFileSync(UPTIME_FILE, JSON.stringify({ timestamp }));
+}
+
+// Calculate uptime in human-readable format
+function getReadableUptime(start) {
+  const diff = Date.now() - start;
+  const seconds = Math.floor(diff / 1000) % 60;
+  const minutes = Math.floor(diff / (1000 * 60)) % 60;
+  const hours = Math.floor(diff / (1000 * 60 * 60)) % 24;
+  const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+
+  return `${days}d ${hours}h ${minutes}m ${seconds}s`;
+}
+
+// On bot ready
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  const info = getLastRestartInfo();
-  const restartType = info?.manual
-    ? '🔁 Bot was manually restarted.'
-    : info?.scheduled
-    ? '🕒 Scheduled restart completed.'
-    : '⚠️ Bot restarted due to a crash or deployment.';
+
+  const previous = loadUptimeData();
+  if (previous?.timestamp) {
+    isRestart = true;
+    launchTime = previous.timestamp;
+  } else {
+    saveUptimeData(launchTime);
+  }
 
   for (const id of DEV_USER_IDS) {
     try {
-      const user = await client.users.fetch(id);
-      user.send(`${restartType}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
+      const dev = await client.users.fetch(id);
+      if (dev) {
+        const note = isRestart ? '🔁 Bot restarted' : '🟢 Bot started';
+        dev.send(`${note} at <t:${Math.floor(Date.now() / 1000)}:F>`);
+      }
     } catch (e) {
-      console.error(`❌ Failed to DM dev ${id}:`, e.message);
+      console.error(`Failed to DM dev (${id}):`, e);
     }
   }
-
-  startTimestamp = getStoredUptime();
-  saveUptime();
-  recordRestart(false, false);
 });
 
-// ──────── MESSAGE COMMANDS ────────
-client.on('messageCreate', async message => {
-  if (message.content === '!restart' && DEV_USER_IDS.includes(message.author.id)) {
-    const reply = await message.reply('🔄 Restarting...');
-    recordRestart(true, false);
-    setTimeout(() => {
-      reply.edit('✅ Successfully restarted!');
-      process.exit(0);
-    }, 1500);
-  }
-
-  if (message.content === '/uptime') {
-    const uptimeMs = Date.now() - getStoredUptime();
-    const totalSeconds = Math.floor(uptimeMs / 1000);
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const seconds = totalSeconds % 60;
-
+// Handle slash commands
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName === 'uptime') {
     const embed = new EmbedBuilder()
-      .setTitle('📊 Bot Uptime')
-      .setColor('Green')
+      .setTitle('📊 Uptime Info')
       .addFields(
         { name: 'Bot Name', value: client.user.tag, inline: true },
         { name: 'Creators', value: DEV_USER_IDS.map(id => `<@${id}>`).join(', '), inline: true },
-        { name: 'Uptime', value: `${hours}h ${minutes}m ${seconds}s`, inline: false }
+        { name: 'Uptime', value: getReadableUptime(launchTime), inline: false }
       )
+      .setColor('Green')
       .setTimestamp();
 
-    message.reply({ embeds: [embed] });
+    await interaction.reply({ embeds: [embed], ephemeral: true });
   }
 });
 
-// ──────── SCHEDULED RESTART (5 MIN INTERVAL) ────────
-let lastScheduled = 0;
-setInterval(() => {
-  const now = new Date();
-  const mins = now.getMinutes();
-  const secs = now.getSeconds();
-
-  // Only restart at :00 of 5-minute intervals, with cooldown to prevent spamming
-  if (mins % 5 === 0 && secs === 0 && Date.now() - lastScheduled > 60000) {
-    lastScheduled = Date.now();
-    recordRestart(false, true);
-    process.exit(0);
+// Register slash command
+async function registerSlash() {
+  const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
+  try {
+    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), {
+      body: [
+        {
+          name: 'uptime',
+          description: 'View how long the bot has been online',
+        }
+      ]
+    });
+    console.log('✅ Slash command registered.');
+  } catch (err) {
+    console.error('❌ Slash registration failed:', err);
   }
-}, 1000);
+}
 
-// ──────── ERROR HANDLERS ────────
-process.on('unhandledRejection', err => {
-  console.error('❌ Unhandled Rejection:', err);
-});
-process.on('uncaughtException', err => {
-  console.error('💥 Uncaught Exception:', err);
-});
-
-// ──────── LOGIN ────────
+registerSlash();
 client.login(process.env.TOKEN);
