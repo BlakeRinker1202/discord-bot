@@ -1,173 +1,200 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder, EmbedBuilder, PermissionsBitField } = require('discord.js');
 const fs = require('fs');
-const os = require('os');
+const { Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder, EmbedBuilder, PermissionsBitField } = require('discord.js');
+const fetch = require('node-fetch');
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
-  partials: [Partials.Channel]
+  intents: [GatewayIntentBits.Guilds],
+  partials: [Partials.Channel],
 });
 
-// ────── PORT ──────
-const express = require('express');
-const app = express();
+const TOKEN = process.env.TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID;
+const DEV_USER_IDS = process.env.DEV_USER_IDS.split(',').map(id => id.trim());
+const UPTIME_FILE = './uptime.json';
+const RESTART_FILE = './restart.json';
+const RESTART_INTERVAL_MINUTES = 5;
+let manualRestart = false;
 
-app.get('/', (req, res) => res.send('✅ Bot is running'));
-app.listen(3000, () => console.log('🌐 Web server is running'));
-// ────── CONFIG ──────
-const RESTART_FILE = './last-restart.json';
-const SCHEDULE_INTERVAL = 5 * 60 * 1000; // Every 5 minutes
-let lastManualRestart = false;
-const devs = process.env.DEV_USER_IDS.split(',');
-
-// ────── RESTART TRACKING ──────
-function recordRestart(type = 'unknown') {
-  fs.writeFileSync(RESTART_FILE, JSON.stringify({
-    timestamp: Date.now(),
-    type
-  }));
-}
-function getLastRestartInfo() {
-  if (!fs.existsSync(RESTART_FILE)) return null;
-  try {
-    return JSON.parse(fs.readFileSync(RESTART_FILE));
-  } catch {
-    return null;
-  }
-}
-function getNextScheduledRestart() {
-  const now = new Date();
-  now.setSeconds(0, 0);
-  const minutes = now.getMinutes();
-  const next = new Date(now);
-  next.setMinutes(minutes - (minutes % 5) + 5);
-  return `<t:${Math.floor(next.getTime() / 1000)}:T>`;
-}
-
-// ────── COMMAND SETUP ──────
+// ======== REST API FOR COMMANDS =========
 const commands = [
   new SlashCommandBuilder()
-    .setName('uptime')
-    .setDescription('Show bot uptime and developer info'),
-  new SlashCommandBuilder()
     .setName('restart')
-    .setDescription('Restart the bot (developers only)'),
+    .setDescription('Manually restarts the bot (CPRO+ only)'),
+  new SlashCommandBuilder()
+    .setName('uptime')
+    .setDescription('Shows how long the bot has been online'),
   new SlashCommandBuilder()
     .setName('status')
-    .setDescription('Show detailed bot status'),
-];
+    .setDescription('Shows bot status and memory usage'),
+].map(cmd => cmd.toJSON());
 
-const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
-
-// ────── REGISTER COMMANDS ──────
+const rest = new REST({ version: '10' }).setToken(TOKEN);
 (async () => {
   try {
     console.log('🔁 Registering slash commands...');
-    await rest.put(
-      Routes.applicationCommands(process.env.CLIENT_ID),
-      { body: commands }
-    );
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
     console.log('✅ Slash commands registered.');
-  } catch (error) {
-    console.error('❌ Failed to register commands:', error);
+  } catch (err) {
+    console.error(err);
   }
 })();
 
-// ────── STARTUP ──────
-client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-  const restartData = getLastRestartInfo();
-  const message = {
-    crash: '⚠️ Bot restarted due to a crash or deploy.',
-    manual: '🔁 Bot was manually restarted.',
-    scheduled: '🕒 Scheduled restart occurred.',
-    unknown: 'ℹ️ Bot restarted (reason unknown).'
-  }[restartData?.type || 'unknown'];
-
-  for (const devId of devs) {
-    try {
-      const dev = await client.users.fetch(devId);
-      dev.send(`${message}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
-    } catch (e) {
-      console.error(`❌ Failed to DM dev (${devId})`);
-    }
+// ======== UPTIME TRACKING =========
+let startupTime = Date.now();
+function loadUptime() {
+  if (fs.existsSync(UPTIME_FILE)) {
+    const data = JSON.parse(fs.readFileSync(UPTIME_FILE));
+    return data.startup || Date.now();
   }
+  return Date.now();
+}
+function saveUptime() {
+  fs.writeFileSync(UPTIME_FILE, JSON.stringify({ startup: startupTime }));
+}
+startupTime = loadUptime();
 
-  recordRestart('crash');
-});
-
-// ────── INTERACTION HANDLER ──────
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-
-  const { commandName } = interaction;
-
-  if (commandName === 'uptime') {
-    const restart = getLastRestartInfo();
-    const uptimeMs = Date.now() - (restart?.timestamp || Date.now());
-    const uptime = Math.floor(uptimeMs / 1000);
-    const embed = new EmbedBuilder()
-      .setTitle('📊 Bot Uptime')
-      .addFields(
-        { name: 'Bot', value: client.user.tag, inline: true },
-        { name: 'Creators', value: devs.map(id => `<@${id}>`).join(', '), inline: true },
-        { name: 'Uptime', value: `<t:${Math.floor((restart?.timestamp || Date.now()) / 1000)}:R>`, inline: false }
-      )
-      .setColor(0x00AE86)
-      .setTimestamp();
-    return interaction.reply({ embeds: [embed], ephemeral: true });
-  }
-
-  if (commandName === 'restart') {
-    const member = await interaction.guild.members.fetch(interaction.user.id);
-    if (!member || !member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: '❌ You don’t have permission to use this.', ephemeral: true });
-    }
-
-    await interaction.reply({ content: '🔄 Restarting bot...', ephemeral: true });
-    for (const devId of devs) {
-      try {
-        const dev = await client.users.fetch(devId);
-        dev.send(`♻️ Bot restart manually triggered by <@${interaction.user.id}>`);
-      } catch { }
-    }
-
-    recordRestart('manual');
-    process.exit(0);
-  }
-
-  if (commandName === 'status') {
-    const used = process.memoryUsage();
-    const mem = `${(used.heapUsed / 1024 / 1024).toFixed(2)} MB`;
-    const restart = getLastRestartInfo();
-    const embed = new EmbedBuilder()
-      .setTitle('📈 Bot Status')
-      .addFields(
-        { name: 'Bot', value: client.user.tag, inline: true },
-        { name: 'Restart Type', value: restart?.type || 'unknown', inline: true },
-        { name: 'Uptime', value: `<t:${Math.floor((restart?.timestamp || Date.now()) / 1000)}:R>`, inline: true },
-        { name: 'Memory Usage', value: mem, inline: true },
-        { name: 'Next Scheduled Restart', value: getNextScheduledRestart(), inline: true },
-        { name: 'Developers', value: devs.map(id => `<@${id}>`).join(', ') }
-      )
-      .setColor(0x3498db)
-      .setTimestamp();
-    return interaction.reply({ embeds: [embed], ephemeral: true });
-  }
-});
-
-// ────── SCHEDULED RESTART ──────
+// ======== SCHEDULED RESTART =========
+function isExact5MinuteMark(date) {
+  return date.getMinutes() % 5 === 0 && date.getSeconds() === 0;
+}
 setInterval(() => {
   const now = new Date();
-  if (now.getMinutes() % 5 === 0 && now.getSeconds() === 0) {
-    for (const devId of devs) {
-      client.users.fetch(devId).then(user => {
-        user.send(`🔁 Scheduled restart at <t:${Math.floor(Date.now() / 1000)}:T>`);
-      }).catch(() => {});
-    }
-    recordRestart('scheduled');
+  if (isExact5MinuteMark(now)) {
+    fs.writeFileSync(RESTART_FILE, JSON.stringify({ time: Date.now(), type: 'scheduled' }));
     process.exit(0);
   }
 }, 1000);
 
-client.login(process.env.TOKEN);
+// ======== ON BOT READY =========
+client.once('ready', async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  const restartInfo = fs.existsSync(RESTART_FILE) ? JSON.parse(fs.readFileSync(RESTART_FILE)) : null;
+  const reason = restartInfo?.type || 'unknown';
+
+  for (const id of DEV_USER_IDS) {
+    try {
+      const dev = await client.users.fetch(id);
+      await dev.send(`✅ Bot is now online.\n🔁 Restart reason: **${reason}**\n🕒 <t:${Math.floor(Date.now() / 1000)}:F>`);
+    } catch (err) {
+      console.warn(`Failed to DM ${id}`);
+    }
+  }
+
+  saveUptime();
+});
+
+// ======== HANDLE COMMANDS =========
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  try {
+    const member = interaction.guild?.members?.cache.get(interaction.user.id);
+    const command = interaction.commandName;
+
+    // /restart
+    if (command === 'restart') {
+      if (!member) return interaction.reply({ content: '❌ You must be in a server to use this.', ephemeral: true });
+      const requiredRole = interaction.guild.roles.cache.find(r => r.id === process.env.REQUIRED_ROLE_ID);
+      if (!requiredRole) return interaction.reply({ content: '❌ Role not found.', ephemeral: true });
+      if (member.roles.highest.position < requiredRole.position) {
+        return interaction.reply({ content: '❌ You do not have permission to restart the bot.', ephemeral: true });
+      }
+
+      await interaction.reply({ content: '🔁 Restarting bot...', ephemeral: true });
+      for (const id of DEV_USER_IDS) {
+        const dev = await client.users.fetch(id);
+        await dev.send(`⚙️ Bot is restarting (manually triggered by ${interaction.user.tag}).`);
+      }
+      fs.writeFileSync(RESTART_FILE, JSON.stringify({ time: Date.now(), type: 'manual' }));
+      process.exit(0);
+    }
+
+    // /uptime
+    else if (command === 'uptime') {
+      const now = Date.now();
+      const uptimeMs = now - startupTime;
+      const uptime = formatDuration(uptimeMs);
+      const embed = new EmbedBuilder()
+        .setTitle('📊 Bot Uptime')
+        .addFields(
+          { name: 'Bot Name', value: client.user.tag, inline: true },
+          { name: 'Developers', value: DEV_USER_IDS.map(id => `<@${id}>`).join(', '), inline: true },
+          { name: 'Uptime', value: uptime, inline: false },
+        )
+        .setColor(0x57F287)
+        .setTimestamp();
+
+      await interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // /status
+    else if (command === 'status') {
+      const used = process.memoryUsage();
+      const embed = new EmbedBuilder()
+        .setTitle('📡 Bot Status')
+        .addFields(
+          { name: 'Bot Name', value: client.user.tag, inline: true },
+          { name: 'RAM Used', value: `${(used.rss / 1024 / 1024).toFixed(2)} MB`, inline: true },
+          { name: 'Uptime Since', value: `<t:${Math.floor(startupTime / 1000)}:F>`, inline: true },
+        )
+        .setColor(0x5865F2)
+        .setTimestamp();
+      await interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+  } catch (err) {
+    console.error('Command error:', err);
+    if (!interaction.replied) {
+      await interaction.reply({ content: '❌ Something went wrong.', ephemeral: true });
+    }
+    reportIncident(`Slash command crash: ${err.message}`);
+  }
+});
+
+// ======== ERROR HANDLERS & BETTERUPTIME =========
+process.on('uncaughtException', err => {
+  console.error('Uncaught Exception:', err);
+  reportIncident('Uncaught Exception: ' + err.message);
+  fs.writeFileSync(RESTART_FILE, JSON.stringify({ time: Date.now(), type: 'crash' }));
+  process.exit(1);
+});
+
+process.on('unhandledRejection', err => {
+  console.error('Unhandled Rejection:', err);
+  reportIncident('Unhandled Rejection: ' + err.message);
+  fs.writeFileSync(RESTART_FILE, JSON.stringify({ time: Date.now(), type: 'crash' }));
+  process.exit(1);
+});
+
+async function reportIncident(message) {
+  if (!process.env.BETTERUPTIME_API_TOKEN || !process.env.BETTERUPTIME_SERVICE_ID) return;
+  try {
+    await fetch('https://betteruptime.com/api/v2/incidents', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.BETTERUPTIME_API_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        incident: {
+          title: message,
+          service_id: process.env.BETTERUPTIME_SERVICE_ID
+        }
+      })
+    });
+  } catch (e) {
+    console.error('Failed to report to BetterUptime:', e);
+  }
+}
+
+function formatDuration(ms) {
+  const sec = Math.floor(ms / 1000);
+  const hrs = Math.floor(sec / 3600);
+  const mins = Math.floor((sec % 3600) / 60);
+  const secs = sec % 60;
+  return `${hrs}h ${mins}m ${secs}s`;
+}
+
+client.login(TOKEN);
