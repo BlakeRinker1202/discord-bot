@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBit, Partials } = require('discord.js');
+const { Client, GatewayIntentBits, Partials } = require('discord.js');
 const express = require('express');
 const fs = require('fs');
 const app = express();
@@ -8,123 +8,133 @@ const app = express();
 app.get('/', (req, res) => {
   res.status(200).send('✅ Bot is running');
 });
+
 app.listen(process.env.PORT || 3000, () => {
-  console.log(`🌐 Web server is running on port ${process.env.PORT || 3000}`);
+  console.log('🌐 Web server is running on port 3000');
 });
 
-// ──────── DISCORD CLIENT ────────
+// ──────── DISCORD BOT CLIENT ────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.MessageContent
   ],
-  partials: [Partials.Channel],
+  partials: [Partials.Channel]
 });
 
-// ──────── RESTART TRACKING ────────
+// ──────── RESTART / CRASH / SCHEDULE DETECTION ────────
 const RESTART_FILE = './last-restart.json';
-let wasManualRestart = false;
-let wasScheduledRestart = false;
-let restartMessageData = null;
+let restartContext = { type: 'crash', timestamp: Date.now(), manualMessageId: null };
 
-function recordRestart(type = 'crash', messageData = null) {
-  const data = {
-    timestamp: Date.now(),
+function recordRestart(type = 'crash', messageId = null) {
+  restartContext = {
     type,
-    messageData
+    timestamp: Date.now(),
+    manualMessageId: messageId
   };
-  fs.writeFileSync(RESTART_FILE, JSON.stringify(data));
+  fs.writeFileSync(RESTART_FILE, JSON.stringify(restartContext));
 }
 
 function getLastRestartInfo() {
   if (!fs.existsSync(RESTART_FILE)) return null;
   try {
-    const data = JSON.parse(fs.readFileSync(RESTART_FILE));
-    wasManualRestart = data.type === 'manual';
-    wasScheduledRestart = data.type === 'scheduled';
-    restartMessageData = data.messageData;
-    return data;
+    return JSON.parse(fs.readFileSync(RESTART_FILE));
   } catch {
     return null;
   }
 }
 
-// ──────── BOT READY ────────
+// ──────── STARTUP ────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
+  const devIDs = process.env.DEV_USER_IDS?.split(',') || [];
   const restartInfo = getLastRestartInfo();
-  const devIDs = process.env.DEV_USER_ID.split(',');
-  const restartType = restartInfo?.type || 'unknown';
-  const readableType = {
-    manual: '🔁 Manual restart',
-    scheduled: '⏰ Scheduled restart',
-    crash: '⚠️ Crash/redeploy',
-  }[restartType] || '🔄 Restart';
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const type = restartInfo?.type || 'crash';
+  const message = {
+    crash: '⚠️ Bot restarted due to a crash or deployment.',
+    manual: '🔁 Bot was manually restarted.',
+    scheduled: '🕒 Bot restarted on schedule.'
+  }[type] || '⚠️ Bot restarted.';
 
   for (const id of devIDs) {
     try {
-      const devUser = await client.users.fetch(id.trim());
-      await devUser.send(`${readableType} occurred.\n⏱️ <t:${Math.floor(Date.now() / 1000)}:F>`);
-    } catch (err) {
-      console.error(`❌ Failed to DM dev ${id}:`, err.message);
+      const user = await client.users.fetch(id);
+      await user.send(`${message}\n⏱️ Restart time: <t:${nowUnix}:F>`);
+    } catch (e) {
+      console.error(`❌ Could not DM dev ${id}`);
     }
   }
 
-  // Edit restart message
-  if (restartInfo?.type === 'manual' && restartInfo.messageData) {
+  if (restartInfo?.type === 'manual' && restartInfo.manualMessageId) {
     try {
-      const channel = await client.channels.fetch(restartInfo.messageData.channelId);
-      const message = await channel.messages.fetch(restartInfo.messageData.messageId);
-      await message.edit('✅ Successfully restarted.');
-    } catch (err) {
-      console.error(`❌ Failed to edit restart message:`, err.message);
-    }
+      const guilds = await client.guilds.fetch();
+      for (const [, guild] of guilds) {
+        const channels = await guild.channels.fetch();
+        for (const [, channel] of channels) {
+          if (channel.isTextBased?.()) {
+            try {
+              const msg = await channel.messages.fetch(restartInfo.manualMessageId);
+              await msg.edit('Successfully Restarted.');
+              break;
+            } catch {}
+          }
+        }
+      }
+    } catch {}
   }
 
-  // Schedule the next clock-based restart
-  scheduleExactRestart();
-
-  recordRestart('crash');
+  recordRestart(); // Record as crash by default after handling
 });
 
-// ──────── MANUAL RESTART COMMAND ────────
+// ──────── MANUAL RESTART ────────
 client.on('messageCreate', async msg => {
-  if (msg.content === '!restart' && process.env.DEV_USER_ID.split(',').includes(msg.author.id)) {
-    const sent = await msg.reply('🔄 Restarting now...');
-    recordRestart('manual', {
-      channelId: msg.channel.id,
-      messageId: sent.id
-    });
+  const devIDs = process.env.DEV_USER_IDS?.split(',') || [];
+  if (msg.content === '!restart' && devIDs.includes(msg.author.id)) {
+    const sent = await msg.reply('Restarting now...');
+    recordRestart('manual', sent.id);
     process.exit(0);
   }
 });
 
-// ──────── EXACT TIME RESTART SCHEDULER ────────
-function scheduleExactRestart() {
+// ──────── SCHEDULED RESTART EVERY 5 MINUTES ────────
+function scheduleRestart() {
   const now = new Date();
-  const next = new Date(now);
-  next.setSeconds(0);
-  next.setMilliseconds(0);
-  next.setMinutes(Math.ceil(now.getMinutes() / 5) * 5);
-
-  const msUntilNextRestart = next.getTime() - now.getTime();
-  console.log(`⏰ Scheduled restart in ${Math.floor(msUntilNextRestart / 1000)} seconds`);
+  const minutes = now.getMinutes();
+  const seconds = now.getSeconds();
+  const delay = ((5 - (minutes % 5)) * 60 - seconds) * 1000;
 
   setTimeout(() => {
-    console.log('🔁 Performing exact 5-minute restart');
-    recordRestart('scheduled');
-    process.exit(0);
-  }, msUntilNextRestart);
+    const lastRestart = getLastRestartInfo();
+    if (
+      !lastRestart ||
+      lastRestart.type !== 'manual' ||
+      Date.now() - lastRestart.timestamp > 2 * 60 * 1000 // ignore recent manual restarts
+    ) {
+      recordRestart('scheduled');
+      process.exit(0);
+    } else {
+      console.log('⏳ Skipping scheduled restart (recent manual restart)');
+      scheduleRestart(); // reschedule next one
+    }
+  }, delay);
 }
 
+scheduleRestart();
+
 // ──────── ERROR HANDLERS ────────
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection:', reason);
-});
 process.on('uncaughtException', err => {
   console.error('💥 Uncaught Exception:', err);
+  recordRestart('crash');
+  process.exit(1);
+});
+
+process.on('unhandledRejection', err => {
+  console.error('💥 Unhandled Rejection:', err);
+  recordRestart('crash');
+  process.exit(1);
 });
 
 client.login(process.env.TOKEN);
