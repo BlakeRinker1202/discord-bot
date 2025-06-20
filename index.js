@@ -8,6 +8,12 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
+// ────── PORT ──────
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => res.send('✅ Bot is running'));
+app.listen(3000, () => console.log('🌐 Web server is running'));
 // ────── CONFIG ──────
 const RESTART_FILE = './last-restart.json';
 const SCHEDULE_INTERVAL = 5 * 60 * 1000; // Every 5 minutes
