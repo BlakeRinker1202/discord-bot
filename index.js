@@ -1,32 +1,42 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, REST, Routes, EmbedBuilder, ActivityType } = require('discord.js');
-const express = require('express');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
-const app = express();
 
-const PORT = process.env.PORT || 3000;
-const DEV_USER_IDS = process.env.DEV_USER_IDS?.split(',') || [];
-
-let startupTime = Date.now();
-let lastRestartTime = 0;
-const cooldownMs = 60 * 1000; // 1 minute cooldown to avoid duplicate restarts
-
-// ──────── EXPRESS SERVER ────────
-app.get('/', (req, res) => res.status(200).send('✅ Bot is running'));
-app.listen(PORT, () => console.log(`🌐 Web server is running on port ${PORT}`));
-
-// ──────── DISCORD BOT CLIENT ────────
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ],
   partials: [Partials.Channel]
 });
 
+// ──────── UPTIME TRACKING ────────
+const UPTIME_FILE = './uptime.json';
+let startTimestamp = Date.now();
+
+function getStoredUptime() {
+  if (fs.existsSync(UPTIME_FILE)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(UPTIME_FILE));
+      return data.timestamp || Date.now();
+    } catch {
+      return Date.now();
+    }
+  }
+  return Date.now();
+}
+
+function saveUptime() {
+  fs.writeFileSync(UPTIME_FILE, JSON.stringify({ timestamp: startTimestamp }));
+}
+
 // ──────── RESTART TRACKING ────────
 const RESTART_FILE = './last-restart.json';
-let wasManual = false;
-let wasScheduled = false;
+const DEV_USER_IDS = process.env.DEV_USER_IDS.split(',').map(id => id.trim());
+let restartMsgMap = new Map();
 
-function recordRestart({ manual = false, scheduled = false } = {}) {
+function recordRestart(manual = false, scheduled = false) {
   fs.writeFileSync(RESTART_FILE, JSON.stringify({
     timestamp: Date.now(),
     manual,
@@ -38,122 +48,81 @@ function getLastRestartInfo() {
   if (!fs.existsSync(RESTART_FILE)) return null;
   try {
     const data = JSON.parse(fs.readFileSync(RESTART_FILE));
-    wasManual = data.manual || false;
-    wasScheduled = data.scheduled || false;
     return data;
   } catch {
     return null;
   }
 }
 
-// ──────── STARTUP ────────
+// ──────── READY ────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  client.user.setActivity('Freshiez Assistant', { type: ActivityType.Watching });
 
-  const restartInfo = getLastRestartInfo();
-  const message = restartInfo?.manual
+  const info = getLastRestartInfo();
+  const restartType = info?.manual
     ? '🔁 Bot was manually restarted.'
-    : restartInfo?.scheduled
-      ? '⏰ Bot was restarted on a schedule.'
-      : '⚠️ Bot restarted due to a crash or deploy.';
+    : info?.scheduled
+    ? '🕒 Scheduled restart completed.'
+    : '⚠️ Bot restarted due to a crash or deployment.';
 
   for (const id of DEV_USER_IDS) {
     try {
-      const devUser = await client.users.fetch(id);
-      await devUser.send(`${message}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
-    } catch (err) {
-      console.warn(`❌ Could not DM developer ${id}: ${err.message}`);
-    }
+      const user = await client.users.fetch(id);
+      user.send(`${restartType}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
+    } catch {}
   }
 
-  recordRestart(); // assume crash unless manual/scheduled set earlier
-  registerSlashCommands();
+  startTimestamp = getStoredUptime();
+  saveUptime();
+  recordRestart(false, false);
 });
 
-// ──────── MANUAL RESTART ────────
-client.on('messageCreate', async (msg) => {
-  if (msg.content === '!restart' && DEV_USER_IDS.includes(msg.author.id)) {
-    const reply = await msg.reply('🔄 Restarting now...');
-    recordRestart({ manual: true });
-    fs.writeFileSync('./restart-msg.json', JSON.stringify({ channelId: msg.channel.id, messageId: reply.id }));
+// ──────── MESSAGE HANDLER ────────
+client.on('messageCreate', async message => {
+  if (message.content === '!restart' && DEV_USER_IDS.includes(message.author.id)) {
+    const reply = await message.reply('🔄 Restarting...');
+    restartMsgMap.set(message.author.id, reply);
+    recordRestart(true, false);
     process.exit(0);
   }
-});
 
-// ──────── RESTORE MESSAGE AFTER RESTART ────────
-async function restoreRestartMessage() {
-  try {
-    const data = JSON.parse(fs.readFileSync('./restart-msg.json'));
-    const channel = await client.channels.fetch(data.channelId);
-    const msg = await channel.messages.fetch(data.messageId);
-    await msg.edit('✅ Successfully restarted.');
-    fs.unlinkSync('./restart-msg.json');
-  } catch {
-    // Message restore failed
-  }
-}
-
-// ──────── SCHEDULED RESTARTS ────────
-setInterval(() => {
-  const now = new Date();
-  const minutes = now.getMinutes();
-  const seconds = now.getSeconds();
-
-  if (minutes % 5 === 0 && seconds < 5) {
-    if (Date.now() - lastRestartTime > cooldownMs) {
-      console.log('⏰ Scheduled restart triggered.');
-      recordRestart({ scheduled: true });
-      lastRestartTime = Date.now();
-      process.exit(0);
-    }
-  }
-}, 1000);
-
-// ──────── SLASH COMMAND REGISTRATION ────────
-function registerSlashCommands() {
-  const commands = [{
-    name: 'uptime',
-    description: 'See how long the bot has been online.'
-  }];
-
-  const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
-  rest.put(Routes.applicationCommands(client.user.id), { body: commands }).then(() => {
-    console.log('✅ Slash commands registered.');
-  }).catch(console.error);
-}
-
-// ──────── SLASH COMMAND HANDLER ────────
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName === 'uptime') {
-    const durationMs = Date.now() - startupTime;
-    const duration = formatDuration(durationMs);
+  if (message.content === '/uptime') {
+    const uptimeMs = Date.now() - getStoredUptime();
+    const uptimeSec = Math.floor(uptimeMs / 1000);
+    const hours = Math.floor(uptimeSec / 3600);
+    const minutes = Math.floor((uptimeSec % 3600) / 60);
+    const seconds = uptimeSec % 60;
 
     const embed = new EmbedBuilder()
-      .setTitle('🤖 Uptime Report')
+      .setTitle('📊 Bot Uptime')
       .setColor('Green')
       .addFields(
-        { name: 'Bot', value: `${client.user.tag}`, inline: true },
-        { name: 'Creator(s)', value: DEV_USER_IDS.map(id => `<@${id}>`).join(', '), inline: true },
-        { name: 'Uptime', value: duration, inline: true }
+        { name: 'Bot Name', value: client.user.tag, inline: true },
+        { name: 'Developers', value: DEV_USER_IDS.map(id => `<@${id}>`).join(', '), inline: true },
+        { name: 'Uptime', value: `${hours}h ${minutes}m ${seconds}s`, inline: false }
       )
       .setTimestamp();
 
-    await interaction.reply({ embeds: [embed] });
+    message.reply({ embeds: [embed] });
   }
 });
 
-// ──────── UTILITY ────────
-function formatDuration(ms) {
-  const seconds = Math.floor(ms / 1000) % 60;
-  const minutes = Math.floor(ms / (1000 * 60)) % 60;
-  const hours = Math.floor(ms / (1000 * 60 * 60)) % 24;
-  const days = Math.floor(ms / (1000 * 60 * 60 * 24));
+// ──────── SCHEDULED RESTART EVERY 5 MINUTES ────────
+setInterval(() => {
+  const now = new Date();
+  if (now.getSeconds() === 0 && now.getMinutes() % 5 === 0) {
+    recordRestart(false, true);
+    process.exit(0);
+  }
+}, 60 * 1000); // check every minute
 
-  return `${days}d ${hours}h ${minutes}m ${seconds}s`;
-}
-
-client.login(process.env.TOKEN).then(() => {
-  setTimeout(restoreRestartMessage, 5000);
+// ──────── ERROR HANDLERS ────────
+process.on('unhandledRejection', err => {
+  console.error('❌ Unhandled Promise Rejection:', err);
 });
+process.on('uncaughtException', err => {
+  console.error('💥 Uncaught Exception:', err);
+});
+
+// ──────── LOGIN ────────
+client.login(process.env.TOKEN);
