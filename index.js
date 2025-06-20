@@ -21,8 +21,13 @@ let manualRestart = false;
 const express = require('express');
 const app = express();
 
-app.get('/', (req, res) => res.send('✅ Bot is running'));
-app.listen(3000, () => console.log('🌐 Web server is running'));
+app.get('/', (req, res) => {
+  res.status(200).send('✅ Bot is running');
+});
+
+app.listen(3000, () => {
+  console.log('🌐 Web server is running on port 3000');
+});
 
 // ======== REST API FOR COMMANDS =========
 const commands = [
