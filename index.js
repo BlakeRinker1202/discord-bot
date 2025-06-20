@@ -23,118 +23,108 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// ──────── RESTART / CRASH / SCHEDULE DETECTION ────────
+// ──────── RESTART TRACKING ────────
 const RESTART_FILE = './last-restart.json';
-let restartContext = { type: 'crash', timestamp: Date.now(), manualMessageId: null };
+let wasManualRestart = false;
+let wasScheduledRestart = false;
+let restartMsgToEdit = null;
 
-function recordRestart(type = 'crash', messageId = null) {
-  restartContext = {
-    type,
+// Write restart reason
+function recordRestart(type = 'crash') {
+  fs.writeFileSync(RESTART_FILE, JSON.stringify({
     timestamp: Date.now(),
-    manualMessageId: messageId
-  };
-  fs.writeFileSync(RESTART_FILE, JSON.stringify(restartContext));
+    type
+  }));
 }
 
+// Read restart info
 function getLastRestartInfo() {
   if (!fs.existsSync(RESTART_FILE)) return null;
   try {
-    return JSON.parse(fs.readFileSync(RESTART_FILE));
-  } catch {
+    const data = JSON.parse(fs.readFileSync(RESTART_FILE));
+    if (data.type === 'manual') wasManualRestart = true;
+    if (data.type === 'scheduled') wasScheduledRestart = true;
+    return data;
+  } catch (e) {
     return null;
   }
 }
 
-// ──────── STARTUP ────────
+// ──────── ON READY ────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
-  const devIDs = process.env.DEV_USER_IDS?.split(',') || [];
   const restartInfo = getLastRestartInfo();
-  const nowUnix = Math.floor(Date.now() / 1000);
-  const type = restartInfo?.type || 'crash';
-  const message = {
-    crash: '⚠️ Bot restarted due to a crash or deployment.',
-    manual: '🔁 Bot was manually restarted.',
-    scheduled: '🕒 Bot restarted on schedule.'
-  }[type] || '⚠️ Bot restarted.';
+  const now = `<t:${Math.floor(Date.now() / 1000)}:F>`;
 
-  for (const id of devIDs) {
+  let restartMessage = '⚠️ Bot restarted due to a crash or deployment.';
+  if (wasManualRestart) restartMessage = '🔁 Bot was manually restarted.';
+  if (wasScheduledRestart) restartMessage = '⏰ Bot restarted on schedule.';
+
+  for (const id of process.env.DEV_USER_IDS.split(',')) {
     try {
-      const user = await client.users.fetch(id);
-      await user.send(`${message}\n⏱️ Restart time: <t:${nowUnix}:F>`);
+      const user = await client.users.fetch(id.trim());
+      if (user) {
+        await user.send(`${restartMessage}\n⏱️ Restart time: ${now}`);
+      }
     } catch (e) {
-      console.error(`❌ Could not DM dev ${id}`);
+      console.warn(`Could not DM user ${id}:`, e.message);
     }
   }
 
-  if (restartInfo?.type === 'manual' && restartInfo.manualMessageId) {
+  if (restartMsgToEdit) {
     try {
-      const guilds = await client.guilds.fetch();
-      for (const [, guild] of guilds) {
-        const channels = await guild.channels.fetch();
-        for (const [, channel] of channels) {
-          if (channel.isTextBased?.()) {
-            try {
-              const msg = await channel.messages.fetch(restartInfo.manualMessageId);
-              await msg.edit('Successfully Restarted.');
-              break;
-            } catch {}
-          }
-        }
-      }
-    } catch {}
+      const [channelId, msgId] = restartMsgToEdit.split('/');
+      const channel = await client.channels.fetch(channelId);
+      const msg = await channel.messages.fetch(msgId);
+      await msg.edit('✅ Successfully Restarted.');
+    } catch (e) {
+      console.warn('Failed to edit restart message:', e.message);
+    }
   }
 
-  recordRestart(); // Record as crash by default after handling
+  recordRestart(); // Mark this as crash unless otherwise set
 });
 
 // ──────── MANUAL RESTART ────────
 client.on('messageCreate', async msg => {
-  const devIDs = process.env.DEV_USER_IDS?.split(',') || [];
-  if (msg.content === '!restart' && devIDs.includes(msg.author.id)) {
-    const sent = await msg.reply('Restarting now...');
-    recordRestart('manual', sent.id);
-    process.exit(0);
+  if (msg.content === '!restart' && process.env.DEV_USER_IDS.split(',').includes(msg.author.id)) {
+    await msg.reply('🔄 Restarting now...').then(m => {
+      restartMsgToEdit = `${m.channel.id}/${m.id}`;
+      recordRestart('manual');
+      fs.writeFileSync('./restart-msg.json', JSON.stringify(restartMsgToEdit));
+      process.exit(0);
+    });
   }
 });
 
-// ──────── SCHEDULED RESTART EVERY 5 MINUTES ────────
-function scheduleRestart() {
+// ──────── SCHEDULED RESTART EVERY 5 MINS ────────
+function scheduleRestartLoop() {
   const now = new Date();
-  const minutes = now.getMinutes();
-  const seconds = now.getSeconds();
-  const delay = ((5 - (minutes % 5)) * 60 - seconds) * 1000;
+  const next = new Date();
+  next.setSeconds(0);
+  next.setMilliseconds(0);
+  next.setMinutes(Math.ceil(now.getMinutes() / 5) * 5);
+
+  const delay = next.getTime() - now.getTime();
+  console.log(`⏳ Next scheduled restart in ${Math.floor(delay / 1000)}s at ${next.toLocaleTimeString()}`);
 
   setTimeout(() => {
-    const lastRestart = getLastRestartInfo();
-    if (
-      !lastRestart ||
-      lastRestart.type !== 'manual' ||
-      Date.now() - lastRestart.timestamp > 2 * 60 * 1000 // ignore recent manual restarts
-    ) {
-      recordRestart('scheduled');
-      process.exit(0);
-    } else {
-      console.log('⏳ Skipping scheduled restart (recent manual restart)');
-      scheduleRestart(); // reschedule next one
-    }
+    recordRestart('scheduled');
+    process.exit(0);
   }, delay);
 }
 
-scheduleRestart();
+// Restore restart edit info
+if (fs.existsSync('./restart-msg.json')) {
+  try {
+    restartMsgToEdit = JSON.parse(fs.readFileSync('./restart-msg.json'));
+    fs.unlinkSync('./restart-msg.json');
+  } catch (e) {
+    restartMsgToEdit = null;
+  }
+}
 
-// ──────── ERROR HANDLERS ────────
-process.on('uncaughtException', err => {
-  console.error('💥 Uncaught Exception:', err);
-  recordRestart('crash');
-  process.exit(1);
-});
-
-process.on('unhandledRejection', err => {
-  console.error('💥 Unhandled Rejection:', err);
-  recordRestart('crash');
-  process.exit(1);
-});
+scheduleRestartLoop();
 
 client.login(process.env.TOKEN);
