@@ -72,25 +72,27 @@ client.once('ready', async () => {
     }
   }
 
-  // Edit message if this was a manual restart
+  // Edit restart message
   if (restartInfo?.type === 'manual' && restartInfo.messageData) {
     try {
       const channel = await client.channels.fetch(restartInfo.messageData.channelId);
       const message = await channel.messages.fetch(restartInfo.messageData.messageId);
-      await message.edit('Successfully restarted.');
+      await message.edit('✅ Successfully restarted.');
     } catch (err) {
       console.error(`❌ Failed to edit restart message:`, err.message);
     }
   }
 
-  // After handling, assume next restart is a crash unless overwritten
+  // Schedule the next clock-based restart
+  scheduleExactRestart();
+
   recordRestart('crash');
 });
 
 // ──────── MANUAL RESTART COMMAND ────────
 client.on('messageCreate', async msg => {
   if (msg.content === '!restart' && process.env.DEV_USER_ID.split(',').includes(msg.author.id)) {
-    const sent = await msg.reply('Restarting now...');
+    const sent = await msg.reply('🔄 Restarting now...');
     recordRestart('manual', {
       channelId: msg.channel.id,
       messageId: sent.id
@@ -99,12 +101,23 @@ client.on('messageCreate', async msg => {
   }
 });
 
-// ──────── SCHEDULED RESTART ────────
-setInterval(() => {
-  console.log('⏰ Scheduled restart triggered');
-  recordRestart('scheduled');
-  process.exit(0);
-}, 5 * 60 * 1000); // Every 5 minutes
+// ──────── EXACT TIME RESTART SCHEDULER ────────
+function scheduleExactRestart() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setSeconds(0);
+  next.setMilliseconds(0);
+  next.setMinutes(Math.ceil(now.getMinutes() / 5) * 5);
+
+  const msUntilNextRestart = next.getTime() - now.getTime();
+  console.log(`⏰ Scheduled restart in ${Math.floor(msUntilNextRestart / 1000)} seconds`);
+
+  setTimeout(() => {
+    console.log('🔁 Performing exact 5-minute restart');
+    recordRestart('scheduled');
+    process.exit(0);
+  }, msUntilNextRestart);
+}
 
 // ──────── ERROR HANDLERS ────────
 process.on('unhandledRejection', (reason, promise) => {
