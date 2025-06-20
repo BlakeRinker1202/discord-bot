@@ -17,6 +17,13 @@ const RESTART_FILE = './restart.json';
 const RESTART_INTERVAL_MINUTES = 5;
 let manualRestart = false;
 
+// ======== PORT =========
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => res.send('✅ Bot is running'));
+app.listen(3000, () => console.log('🌐 Web server is running'));
+
 // ======== REST API FOR COMMANDS =========
 const commands = [
   new SlashCommandBuilder()
