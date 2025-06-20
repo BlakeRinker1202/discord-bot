@@ -5,7 +5,7 @@ const fs = require('fs');
 const app = express();
 
 const RESTART_FILE = './last-restart.json';
-
+l
 // ──────── EXPRESS ────────
 app.get('/', (req, res) => {
   res.status(200).send('✅ Bot is running');
