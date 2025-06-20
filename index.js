@@ -1,104 +1,193 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, REST, Routes, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
 
+// ──────── CONFIG ────────
+const TOKEN = process.env.TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const DEV_USER_IDS = process.env.DEV_USER_IDS.split(','); // comma-separated list
+const RESTART_FILE = './restart-info.json';
+const UPTIME_FILE = './uptime.json';
+
+let wasManualRestart = false;
+let wasScheduledRestart = false;
+
+// ──────── BOT CLIENT ────────
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
   partials: [Partials.Channel],
 });
 
-const DEV_USER_IDS = process.env.DEV_USER_IDS.split(','); // comma-separated in .env
-const UPTIME_FILE = path.join(__dirname, 'uptime.json');
-let launchTime = Date.now();
-let isRestart = false;
+// ──────── TIMESTAMP HELPERS ────────
+function nowTs() {
+  return Math.floor(Date.now() / 1000);
+}
 
-// Read last startup time
-function loadUptimeData() {
-  if (!fs.existsSync(UPTIME_FILE)) return null;
+// ──────── RESTART TRACKING ────────
+function recordRestart(type = 'crash') {
+  const data = {
+    timestamp: Date.now(),
+    type: type
+  };
+  fs.writeFileSync(RESTART_FILE, JSON.stringify(data));
+}
+
+function getRestartInfo() {
   try {
-    return JSON.parse(fs.readFileSync(UPTIME_FILE));
+    const data = JSON.parse(fs.readFileSync(RESTART_FILE));
+    wasManualRestart = data.type === 'manual';
+    wasScheduledRestart = data.type === 'scheduled';
+    return data;
   } catch {
     return null;
   }
 }
 
-// Save new startup time
-function saveUptimeData(timestamp) {
-  fs.writeFileSync(UPTIME_FILE, JSON.stringify({ timestamp }));
+// ──────── UPTIME TRACKING ────────
+function recordUptimeStart() {
+  const data = {
+    onlineSince: Date.now(),
+    totalUptime: getTotalUptime() // carry over existing total uptime
+  };
+  fs.writeFileSync(UPTIME_FILE, JSON.stringify(data));
 }
 
-// Calculate uptime in human-readable format
-function getReadableUptime(start) {
-  const diff = Date.now() - start;
-  const seconds = Math.floor(diff / 1000) % 60;
-  const minutes = Math.floor(diff / (1000 * 60)) % 60;
-  const hours = Math.floor(diff / (1000 * 60 * 60)) % 24;
-  const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-
-  return `${days}d ${hours}h ${minutes}m ${seconds}s`;
+function getUptimeInfo() {
+  try {
+    return JSON.parse(fs.readFileSync(UPTIME_FILE));
+  } catch {
+    return { onlineSince: Date.now(), totalUptime: 0 };
+  }
 }
 
-// On bot ready
+function getTotalUptime() {
+  const info = getUptimeInfo();
+  return info.totalUptime || 0;
+}
+
+function updateTotalUptime() {
+  const info = getUptimeInfo();
+  const sessionUptime = Date.now() - info.onlineSince;
+  const total = sessionUptime + (info.totalUptime || 0);
+  fs.writeFileSync(UPTIME_FILE, JSON.stringify({
+    onlineSince: Date.now(),
+    totalUptime: total
+  }));
+  return total;
+}
+
+// ──────── COMMAND SETUP ────────
+async function registerCommands() {
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('uptime')
+      .setDescription('Shows bot uptime and creator info.')
+  ].map(cmd => cmd.toJSON());
+
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+  console.log('✅ Slash commands registered.');
+}
+
+// ──────── RESTART MESSAGE HANDLING ────────
+const restartMessages = new Map();
+
+client.on('messageCreate', async message => {
+  if (message.content === '!restart' && DEV_USER_IDS.includes(message.author.id)) {
+    const reply = await message.reply('🔁 Restarting...');
+    restartMessages.set(message.author.id, reply);
+    recordRestart('manual');
+    updateTotalUptime();
+    process.exit(0);
+  }
+});
+
+// ──────── READY EVENT ────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  const restartInfo = getRestartInfo();
 
-  const previous = loadUptimeData();
-  if (previous?.timestamp) {
-    isRestart = true;
-    launchTime = previous.timestamp;
-  } else {
-    saveUptimeData(launchTime);
+  for (const devId of DEV_USER_IDS) {
+    const devUser = await client.users.fetch(devId);
+    if (!devUser) continue;
+
+    let restartText = '🔁 Bot restarted';
+    if (restartInfo?.type === 'manual') restartText = '🔁 Bot was manually restarted';
+    else if (restartInfo?.type === 'scheduled') restartText = '⏰ Bot restarted on schedule';
+    else restartText = '⚠️ Bot crashed and restarted';
+
+    await devUser.send(`${restartText}\n⏱️ Time: <t:${nowTs()}:F>`);
   }
 
-  for (const id of DEV_USER_IDS) {
+  const msg = restartMessages.get(DEV_USER_IDS[0]);
+  if (msg) {
     try {
-      const dev = await client.users.fetch(id);
-      if (dev) {
-        const note = isRestart ? '🔁 Bot restarted' : '🟢 Bot started';
-        dev.send(`${note} at <t:${Math.floor(Date.now() / 1000)}:F>`);
-      }
-    } catch (e) {
-      console.error(`Failed to DM dev (${id}):`, e);
-    }
+      await msg.edit('✅ Successfully restarted.');
+    } catch {}
+
+    restartMessages.delete(DEV_USER_IDS[0]);
   }
+
+  recordRestart('crash'); // default to crash unless overridden
+  recordUptimeStart();
 });
 
-// Handle slash commands
+// ──────── SLASH COMMANDS ────────
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
+
   if (interaction.commandName === 'uptime') {
+    const info = getUptimeInfo();
+    const uptimeMs = Date.now() - info.onlineSince + (info.totalUptime || 0);
+    const totalSeconds = Math.floor(uptimeMs / 1000);
+    const days = Math.floor(totalSeconds / 86400);
+    const hours = Math.floor((totalSeconds % 86400) / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
     const embed = new EmbedBuilder()
-      .setTitle('📊 Uptime Info')
-      .addFields(
-        { name: 'Bot Name', value: client.user.tag, inline: true },
-        { name: 'Creators', value: DEV_USER_IDS.map(id => `<@${id}>`).join(', '), inline: true },
-        { name: 'Uptime', value: getReadableUptime(launchTime), inline: false }
-      )
+      .setTitle('📈 Bot Uptime')
       .setColor('Green')
+      .addFields(
+        { name: '🤖 Bot', value: `${client.user.tag}`, inline: true },
+        { name: '👨‍💻 Developers', value: DEV_USER_IDS.map(id => `<@${id}>`).join(', '), inline: true },
+        { name: '🕒 Uptime', value: `${days}d ${hours}h ${minutes}m ${seconds}s`, inline: true },
+        { name: '🟢 Online Since', value: `<t:${Math.floor(info.onlineSince / 1000)}:F>` }
+      )
       .setTimestamp();
 
-    await interaction.reply({ embeds: [embed], ephemeral: true });
+    await interaction.reply({ embeds: [embed] });
   }
 });
 
-// Register slash command
-async function registerSlash() {
-  const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
-  try {
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), {
-      body: [
-        {
-          name: 'uptime',
-          description: 'View how long the bot has been online',
-        }
-      ]
-    });
-    console.log('✅ Slash command registered.');
-  } catch (err) {
-    console.error('❌ Slash registration failed:', err);
-  }
+// ──────── SCHEDULED RESTART EVERY 5 MINUTES ────────
+function scheduleRestarts() {
+  setInterval(() => {
+    const now = new Date();
+    const mins = now.getMinutes();
+    if (mins % 5 === 0 && now.getSeconds() < 10) {
+      const last = getRestartInfo();
+      if (last && Date.now() - last.timestamp < 60_000) return; // cooldown 1 min
+      recordRestart('scheduled');
+      updateTotalUptime();
+      process.exit(0);
+    }
+  }, 10_000);
 }
 
-registerSlash();
-client.login(process.env.TOKEN);
+process.on('SIGINT', updateTotalUptime);
+process.on('SIGTERM', updateTotalUptime);
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  updateTotalUptime();
+  process.exit(1);
+});
+
+registerCommands();
+client.login(TOKEN);
+scheduleRestarts();
