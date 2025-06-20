@@ -1,182 +1,167 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, REST, Routes, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder, EmbedBuilder, PermissionsBitField } = require('discord.js');
 const fs = require('fs');
+const os = require('os');
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
   partials: [Partials.Channel]
 });
 
-// ENV
-const TOKEN = process.env.TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID;
-const DEV_IDS = process.env.DEV_USER_IDS?.split(',') || [];
-const RESTART_ROLE_ID = process.env.RESTART_ROLE_ID;
-
+// ────── CONFIG ──────
 const RESTART_FILE = './last-restart.json';
-let restartMessageInfo = null;
+const SCHEDULE_INTERVAL = 5 * 60 * 1000; // Every 5 minutes
+let lastManualRestart = false;
+const devs = process.env.DEV_USER_IDS.split(',');
 
-// ──────── TIMESTAMP TRACKING ────────
-function recordRestart(type = 'crash') {
-  const data = {
+// ────── RESTART TRACKING ──────
+function recordRestart(type = 'unknown') {
+  fs.writeFileSync(RESTART_FILE, JSON.stringify({
     timestamp: Date.now(),
-    type,
-    restartMessageInfo
-  };
-  fs.writeFileSync(RESTART_FILE, JSON.stringify(data));
+    type
+  }));
 }
-
-function getLastRestart() {
+function getLastRestartInfo() {
+  if (!fs.existsSync(RESTART_FILE)) return null;
   try {
     return JSON.parse(fs.readFileSync(RESTART_FILE));
   } catch {
     return null;
   }
 }
-
-function getUptimeSeconds() {
-  const last = getLastRestart();
-  return last ? Math.floor((Date.now() - last.timestamp) / 1000) : 0;
-}
-
-// ──────── SCHEDULED RESTART (EVERY 5 MINUTES) ────────
-function scheduleRestart() {
+function getNextScheduledRestart() {
   const now = new Date();
+  now.setSeconds(0, 0);
+  const minutes = now.getMinutes();
   const next = new Date(now);
-  next.setSeconds(0);
-  next.setMilliseconds(0);
-  next.setMinutes(Math.ceil(now.getMinutes() / 5) * 5);
-  if (next <= now) next.setMinutes(next.getMinutes() + 5);
-
-  const delay = next - now;
-  setTimeout(() => {
-    for (const id of DEV_IDS) {
-      client.users.fetch(id).then(user =>
-        user.send('⏰ Scheduled restart triggered.').catch(() => {})
-      );
-    }
-    recordRestart('scheduled');
-    process.exit(0);
-  }, delay);
+  next.setMinutes(minutes - (minutes % 5) + 5);
+  return `<t:${Math.floor(next.getTime() / 1000)}:T>`;
 }
 
-// ──────── SLASH COMMAND SETUP ────────
+// ────── COMMAND SETUP ──────
 const commands = [
-  {
-    name: 'uptime',
-    description: 'Check bot uptime.'
-  },
-  {
-    name: 'restart',
-    description: 'Manually restart the bot (CPRO+ only).'
-  }
+  new SlashCommandBuilder()
+    .setName('uptime')
+    .setDescription('Show bot uptime and developer info'),
+  new SlashCommandBuilder()
+    .setName('restart')
+    .setDescription('Restart the bot (developers only)'),
+  new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('Show detailed bot status'),
 ];
 
-async function registerSlashCommands() {
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
+const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
+
+// ────── REGISTER COMMANDS ──────
+(async () => {
   try {
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    console.log('🔁 Registering slash commands...');
+    await rest.put(
+      Routes.applicationCommands(process.env.CLIENT_ID),
+      { body: commands }
+    );
     console.log('✅ Slash commands registered.');
   } catch (error) {
-    console.error('❌ Failed to register slash commands:', error);
+    console.error('❌ Failed to register commands:', error);
   }
-}
+})();
 
-// ──────── INTERACTION HANDLER ────────
+// ────── STARTUP ──────
+client.once('ready', async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  const restartData = getLastRestartInfo();
+  const message = {
+    crash: '⚠️ Bot restarted due to a crash or deploy.',
+    manual: '🔁 Bot was manually restarted.',
+    scheduled: '🕒 Scheduled restart occurred.',
+    unknown: 'ℹ️ Bot restarted (reason unknown).'
+  }[restartData?.type || 'unknown'];
+
+  for (const devId of devs) {
+    try {
+      const dev = await client.users.fetch(devId);
+      dev.send(`${message}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
+    } catch (e) {
+      console.error(`❌ Failed to DM dev (${devId})`);
+    }
+  }
+
+  recordRestart('crash');
+});
+
+// ────── INTERACTION HANDLER ──────
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isCommand()) return;
+  if (!interaction.isChatInputCommand()) return;
 
-  if (interaction.commandName === 'uptime') {
-    const uptime = getUptimeSeconds();
+  const { commandName } = interaction;
+
+  if (commandName === 'uptime') {
+    const restart = getLastRestartInfo();
+    const uptimeMs = Date.now() - (restart?.timestamp || Date.now());
+    const uptime = Math.floor(uptimeMs / 1000);
     const embed = new EmbedBuilder()
       .setTitle('📊 Bot Uptime')
       .addFields(
-        { name: 'Bot Name', value: client.user.username, inline: true },
-        { name: 'Created By', value: DEV_IDS.map(id => `<@${id}>`).join(', '), inline: true },
-        { name: 'Uptime', value: `<t:${Math.floor((Date.now() - uptime * 1000) / 1000)}:R>`, inline: false }
+        { name: 'Bot', value: client.user.tag, inline: true },
+        { name: 'Creators', value: devs.map(id => `<@${id}>`).join(', '), inline: true },
+        { name: 'Uptime', value: `<t:${Math.floor((restart?.timestamp || Date.now()) / 1000)}:R>`, inline: false }
       )
-      .setColor('Green')
+      .setColor(0x00AE86)
       .setTimestamp();
-
-    try {
-      await interaction.reply({ embeds: [embed], ephemeral: true });
-    } catch (err) {
-      console.error('❌ Failed to send /uptime:', err);
-    }
+    return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
-  if (interaction.commandName === 'restart') {
-    const member = interaction.member;
-    const guild = interaction.guild;
-    const role = guild?.roles.cache.get(RESTART_ROLE_ID);
-
-    const allowed =
-      !guild || !role || member.roles.highest.position >= role.position;
-
-    if (!allowed) {
-      return interaction.reply({ content: '🚫 You lack permission.', ephemeral: true });
+  if (commandName === 'restart') {
+    const member = await interaction.guild.members.fetch(interaction.user.id);
+    if (!member || !member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+      return interaction.reply({ content: '❌ You don’t have permission to use this.', ephemeral: true });
     }
 
-    const reply = await interaction.reply({ content: '🔄 Restarting...', fetchReply: true }).catch(() => null);
-    restartMessageInfo = reply
-      ? { channelId: reply.channelId, messageId: reply.id }
-      : null;
-
-    for (const id of DEV_IDS) {
-      const user = await client.users.fetch(id).catch(() => null);
-      if (user) user.send(`🔁 Manual restart triggered by ${interaction.user.tag}`).catch(() => {});
+    await interaction.reply({ content: '🔄 Restarting bot...', ephemeral: true });
+    for (const devId of devs) {
+      try {
+        const dev = await client.users.fetch(devId);
+        dev.send(`♻️ Bot restart manually triggered by <@${interaction.user.id}>`);
+      } catch { }
     }
 
     recordRestart('manual');
     process.exit(0);
   }
-});
 
-// ──────── STARTUP ────────
-client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-  registerSlashCommands();
-
-  const last = getLastRestart();
-  for (const id of DEV_IDS) {
-    const user = await client.users.fetch(id).catch(() => null);
-    if (user) {
-      const msg = last?.type === 'manual'
-        ? '🔁 Bot manually restarted.'
-        : last?.type === 'scheduled'
-          ? '⏰ Scheduled restart occurred.'
-          : '⚠️ Bot restarted due to crash or deployment.';
-
-      await user.send(`${msg}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`).catch(() => {});
-    }
+  if (commandName === 'status') {
+    const used = process.memoryUsage();
+    const mem = `${(used.heapUsed / 1024 / 1024).toFixed(2)} MB`;
+    const restart = getLastRestartInfo();
+    const embed = new EmbedBuilder()
+      .setTitle('📈 Bot Status')
+      .addFields(
+        { name: 'Bot', value: client.user.tag, inline: true },
+        { name: 'Restart Type', value: restart?.type || 'unknown', inline: true },
+        { name: 'Uptime', value: `<t:${Math.floor((restart?.timestamp || Date.now()) / 1000)}:R>`, inline: true },
+        { name: 'Memory Usage', value: mem, inline: true },
+        { name: 'Next Scheduled Restart', value: getNextScheduledRestart(), inline: true },
+        { name: 'Developers', value: devs.map(id => `<@${id}>`).join(', ') }
+      )
+      .setColor(0x3498db)
+      .setTimestamp();
+    return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+});
 
-  if (last?.restartMessageInfo) {
-    const { channelId, messageId } = last.restartMessageInfo;
-    const channel = await client.channels.fetch(channelId).catch(() => null);
-    if (channel?.isTextBased()) {
-      channel.messages.fetch(messageId)
-        .then(msg => msg.edit('✅ Bot restarted successfully.'))
-        .catch(() => {});
+// ────── SCHEDULED RESTART ──────
+setInterval(() => {
+  const now = new Date();
+  if (now.getMinutes() % 5 === 0 && now.getSeconds() === 0) {
+    for (const devId of devs) {
+      client.users.fetch(devId).then(user => {
+        user.send(`🔁 Scheduled restart at <t:${Math.floor(Date.now() / 1000)}:T>`);
+      }).catch(() => {});
     }
+    recordRestart('scheduled');
+    process.exit(0);
   }
+}, 1000);
 
-  recordRestart('crash'); // In case it wasn’t detected
-  scheduleRestart(); // Always schedule restart again
-});
-
-// ──────── CRASH HANDLERS ────────
-process.on('uncaughtException', err => {
-  console.error('💥 Uncaught Exception:', err);
-  recordRestart('crash');
-  process.exit(1);
-});
-
-process.on('unhandledRejection', err => {
-  console.error('❌ Unhandled Rejection:', err);
-  recordRestart('crash');
-  process.exit(1);
-});
-
-client.login(TOKEN);
+client.login(process.env.TOKEN);
