@@ -4,16 +4,18 @@ const express = require('express');
 const fs = require('fs');
 const app = express();
 
-// ──────── EXPRESS SERVER ────────
+const RESTART_FILE = './last-restart.json';
+let wasManualRestart = false;
+
+// ──────── EXPRESS KEEP-ALIVE ────────
 app.get('/', (req, res) => {
   res.status(200).send('✅ Bot is running');
 });
-
 app.listen(3000, () => {
   console.log('🌐 Web server is running on port 3000');
 });
 
-// ──────── DISCORD BOT CLIENT ────────
+// ──────── BOT CLIENT ────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -23,11 +25,7 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// ──────── RESTART / CRASH DETECTION ────────
-const RESTART_FILE = './last-restart.json';
-let wasManualRestart = false;
-
-// Called before shutdown or restart
+// ──────── RESTART TRACKING ────────
 function recordRestart(manual = false) {
   fs.writeFileSync(RESTART_FILE, JSON.stringify({
     timestamp: Date.now(),
@@ -49,26 +47,67 @@ function getLastRestartInfo() {
 // ──────── STARTUP ────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  const devIDs = process.env.DEV_USER_IDS.split(',');
+  const restartInfo = getLastRestartInfo();
 
-  const devUser = await client.users.fetch(process.env.DEV_USER_ID);
-  if (devUser) {
-    const restartInfo = getLastRestartInfo();
-    const message = restartInfo?.manual
-      ? '🔁 Bot was manually restarted.'
-      : '⚠️ Bot restarted due to a crash or deployment.';
-    devUser.send(`${message}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
+  for (const id of devIDs) {
+    try {
+      const user = await client.users.fetch(id.trim());
+      const msg = restartInfo?.manual
+        ? '🔁 Bot was manually restarted.'
+        : '⚠️ Bot restarted due to a crash, error, or scheduled restart.';
+      await user.send(`${msg}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
+    } catch (e) {
+      console.warn(`❌ Could not DM dev ${id}: ${e.message}`);
+    }
   }
 
-  recordRestart(false); // Automatically assume crash/redeploy
+  recordRestart(false);
 });
 
-// ──────── COMMAND TO MANUALLY RESTART ────────
+// ──────── MANUAL RESTART CMD ────────
 client.on('messageCreate', async msg => {
-  if (msg.content === '!restart' && msg.author.id === process.env.DEV_USER_ID) {
-    await msg.reply('🔄 Restarting now...');
+  if (
+    msg.content === '!restart' &&
+    process.env.DEV_USER_IDS.split(',').includes(msg.author.id)
+  ) {
+    const reply = await msg.reply('Restarting now...');
     recordRestart(true);
+    fs.writeFileSync('./last-restart-msg.json', JSON.stringify({ channel: msg.channelId, message: reply.id }));
     process.exit(0);
   }
 });
+
+// ──────── EDIT MESSAGE AFTER RESTART ────────
+client.on('ready', async () => {
+  try {
+    const data = JSON.parse(fs.readFileSync('./last-restart-msg.json'));
+    const channel = await client.channels.fetch(data.channel);
+    const message = await channel.messages.fetch(data.message);
+    await message.edit('Successfully restarted.');
+    fs.unlinkSync('./last-restart-msg.json');
+  } catch (err) {
+    // Message not found or nothing to update
+  }
+});
+
+// ──────── ERROR HANDLERS ────────
+process.on('uncaughtException', err => {
+  console.error('💥 Uncaught Exception:', err);
+  recordRestart(false);
+  process.exit(1);
+});
+process.on('unhandledRejection', err => {
+  console.error('💥 Unhandled Rejection:', err);
+  recordRestart(false);
+  process.exit(1);
+});
+
+// ──────── AUTO RESTART EVERY 20 MINS ────────
+setInterval(() => {
+  console.log('⏱️ Scheduled auto-restart...');
+  recordRestart(false);
+  process.exit(0);
+}, 20 * 60 * 1000); // 20 minutes
 
 client.login(process.env.TOKEN);
