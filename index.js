@@ -1,37 +1,73 @@
-require("dotenv").config();
-const { Client, GatewayIntentBits } = require("discord.js");
-const express = require("express");
-
+require('dotenv').config();
+const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const express = require('express');
+const fs = require('fs');
 const app = express();
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
-});
 
-// Web server for uptime checks
-app.get("/", (req, res) => {
-  res.status(200).send("✅ Bot is online!");
+// ──────── EXPRESS SERVER ────────
+app.get('/', (req, res) => {
+  res.status(200).send('✅ Bot is running');
 });
 
 app.listen(3000, () => {
-  console.log("🌐 Web server is running on port 3000");
+  console.log('🌐 Web server is running on port 3000');
 });
 
-// Notify dev when bot restarts
-client.once("ready", async () => {
+// ──────── DISCORD BOT CLIENT ────────
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [Partials.Channel]
+});
+
+// ──────── RESTART / CRASH DETECTION ────────
+const RESTART_FILE = './last-restart.json';
+let wasManualRestart = false;
+
+// Called before shutdown or restart
+function recordRestart(manual = false) {
+  fs.writeFileSync(RESTART_FILE, JSON.stringify({
+    timestamp: Date.now(),
+    manual: manual
+  }));
+}
+
+function getLastRestartInfo() {
+  if (!fs.existsSync(RESTART_FILE)) return null;
+  try {
+    const data = JSON.parse(fs.readFileSync(RESTART_FILE));
+    wasManualRestart = data.manual || false;
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ──────── STARTUP ────────
+client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
-  const reason = process.env.RESTART_REASON || "unknown";
-  const devUserId = process.env.DEV_USER_ID;
+  const devUser = await client.users.fetch(process.env.DEV_USER_ID);
+  if (devUser) {
+    const restartInfo = getLastRestartInfo();
+    const message = restartInfo?.manual
+      ? '🔁 Bot was manually restarted.'
+      : '⚠️ Bot restarted due to a crash or deployment.';
+    devUser.send(`${message}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
+  }
 
-  if (devUserId) {
-    try {
-      const devUser = await client.users.fetch(devUserId);
-      await devUser.send(`🌀 **Bot restarted**\n**Reason:** \`${reason}\``);
-    } catch (err) {
-      console.error("❌ Failed to DM developer:", err);
-    }
-  } else {
-    console.warn("⚠️ DEV_USER_ID not set in .env or Render env variables");
+  recordRestart(false); // Automatically assume crash/redeploy
+});
+
+// ──────── COMMAND TO MANUALLY RESTART ────────
+client.on('messageCreate', async msg => {
+  if (msg.content === '!restart' && msg.author.id === process.env.DEV_USER_ID) {
+    await msg.reply('🔄 Restarting now...');
+    recordRestart(true);
+    process.exit(0);
   }
 });
 
