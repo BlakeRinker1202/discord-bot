@@ -1,16 +1,19 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, REST, Routes, EmbedBuilder, ActivityType } = require('discord.js');
 const express = require('express');
 const fs = require('fs');
 const app = express();
 
+const PORT = process.env.PORT || 3000;
+const DEV_USER_IDS = process.env.DEV_USER_IDS?.split(',') || [];
+
+let startupTime = Date.now();
+let lastRestartTime = 0;
+const cooldownMs = 60 * 1000; // 1 minute cooldown to avoid duplicate restarts
+
 // ──────── EXPRESS SERVER ────────
-app.get('/', (req, res) => {
-  res.status(200).send('✅ Bot is running');
-});
-app.listen(process.env.PORT || 3000, () => {
-  console.log('🌐 Web server is running on port 3000');
-});
+app.get('/', (req, res) => res.status(200).send('✅ Bot is running'));
+app.listen(PORT, () => console.log(`🌐 Web server is running on port ${PORT}`));
 
 // ──────── DISCORD BOT CLIENT ────────
 const client = new Client({
@@ -20,118 +23,137 @@ const client = new Client({
 
 // ──────── RESTART TRACKING ────────
 const RESTART_FILE = './last-restart.json';
-const MSG_FILE = './restart-msg.json';
-let wasManualRestart = false;
-let wasScheduledRestart = false;
-let restartMsgToEdit = null;
+let wasManual = false;
+let wasScheduled = false;
 
-// Write restart reason
-function recordRestart(type = 'crash') {
+function recordRestart({ manual = false, scheduled = false } = {}) {
   fs.writeFileSync(RESTART_FILE, JSON.stringify({
     timestamp: Date.now(),
-    type
+    manual,
+    scheduled
   }));
 }
 
-// Read last restart info
 function getLastRestartInfo() {
   if (!fs.existsSync(RESTART_FILE)) return null;
   try {
     const data = JSON.parse(fs.readFileSync(RESTART_FILE));
-    if (data.type === 'manual') wasManualRestart = true;
-    if (data.type === 'scheduled') wasScheduledRestart = true;
+    wasManual = data.manual || false;
+    wasScheduled = data.scheduled || false;
     return data;
   } catch {
     return null;
   }
 }
 
-// ──────── ON READY ────────
+// ──────── STARTUP ────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  client.user.setActivity('Freshiez Assistant', { type: ActivityType.Watching });
 
   const restartInfo = getLastRestartInfo();
-  const now = `<t:${Math.floor(Date.now() / 1000)}:F>`;
+  const message = restartInfo?.manual
+    ? '🔁 Bot was manually restarted.'
+    : restartInfo?.scheduled
+      ? '⏰ Bot was restarted on a schedule.'
+      : '⚠️ Bot restarted due to a crash or deploy.';
 
-  let restartMessage = '⚠️ Bot restarted due to a crash or deployment.';
-  if (wasManualRestart) restartMessage = '🔁 Bot was manually restarted.';
-  if (wasScheduledRestart) restartMessage = '⏰ Bot restarted on schedule.';
-
-  for (const id of process.env.DEV_USER_IDS.split(',')) {
+  for (const id of DEV_USER_IDS) {
     try {
-      const user = await client.users.fetch(id.trim());
-      await user.send(`${restartMessage}\n⏱️ Restart time: ${now}`);
-    } catch (e) {
-      console.warn(`⚠️ Could not DM ${id}:`, e.message);
+      const devUser = await client.users.fetch(id);
+      await devUser.send(`${message}\n⏱️ Restart time: <t:${Math.floor(Date.now() / 1000)}:F>`);
+    } catch (err) {
+      console.warn(`❌ Could not DM developer ${id}: ${err.message}`);
     }
   }
 
-  if (restartMsgToEdit) {
-    try {
-      const [channelId, msgId] = restartMsgToEdit.split('/');
-      const channel = await client.channels.fetch(channelId);
-      const msg = await channel.messages.fetch(msgId);
-      await msg.edit('✅ Successfully Restarted.');
-    } catch (e) {
-      console.warn('⚠️ Could not edit restart message:', e.message);
-    }
-  }
-
-  recordRestart(); // Mark this as crash unless overridden
-
-  scheduleNextRestart();
+  recordRestart(); // assume crash unless manual/scheduled set earlier
+  registerSlashCommands();
 });
 
 // ──────── MANUAL RESTART ────────
-client.on('messageCreate', async msg => {
-  if (msg.content === '!restart' && process.env.DEV_USER_IDS.split(',').includes(msg.author.id)) {
-    await msg.reply('🔄 Restarting now...').then(m => {
-      restartMsgToEdit = `${m.channel.id}/${m.id}`;
-      recordRestart('manual');
-      fs.writeFileSync(MSG_FILE, JSON.stringify(restartMsgToEdit));
-      process.exit(0);
-    });
+client.on('messageCreate', async (msg) => {
+  if (msg.content === '!restart' && DEV_USER_IDS.includes(msg.author.id)) {
+    const reply = await msg.reply('🔄 Restarting now...');
+    recordRestart({ manual: true });
+    fs.writeFileSync('./restart-msg.json', JSON.stringify({ channelId: msg.channel.id, messageId: reply.id }));
+    process.exit(0);
   }
 });
 
-// ──────── SCHEDULED RESTART WITH COOLDOWN ────────
-function scheduleNextRestart() {
-  const now = new Date();
-  const minutes = now.getMinutes();
-  const remainder = 5 - (minutes % 5);
-  const next = new Date(now.getTime() + remainder * 60000);
-
-  next.setSeconds(0);
-  next.setMilliseconds(0);
-
-  const delay = next.getTime() - now.getTime();
-  console.log(`⏳ Next scheduled restart in ${Math.floor(delay / 1000)}s at ${next.toLocaleTimeString()}`);
-
-  setTimeout(() => {
-    const info = getLastRestartInfo();
-    const lastTimestamp = info?.timestamp || 0;
-
-    const sameInterval = Math.floor(Date.now() / 1000 / 300) === Math.floor(lastTimestamp / 1000 / 300);
-
-    if (!sameInterval) {
-      console.log('🔁 Scheduled restart executing...');
-      recordRestart('scheduled');
-      process.exit(0);
-    } else {
-      console.log('⏸ Skipping restart - already restarted in this interval.');
-      scheduleNextRestart(); // reschedule
-    }
-  }, delay);
-}
-
-// ──────── RESTORE MESSAGE TO EDIT ────────
-if (fs.existsSync(MSG_FILE)) {
+// ──────── RESTORE MESSAGE AFTER RESTART ────────
+async function restoreRestartMessage() {
   try {
-    restartMsgToEdit = JSON.parse(fs.readFileSync(MSG_FILE));
-    fs.unlinkSync(MSG_FILE);
+    const data = JSON.parse(fs.readFileSync('./restart-msg.json'));
+    const channel = await client.channels.fetch(data.channelId);
+    const msg = await channel.messages.fetch(data.messageId);
+    await msg.edit('✅ Successfully restarted.');
+    fs.unlinkSync('./restart-msg.json');
   } catch {
-    restartMsgToEdit = null;
+    // Message restore failed
   }
 }
 
-client.login(process.env.TOKEN);
+// ──────── SCHEDULED RESTARTS ────────
+setInterval(() => {
+  const now = new Date();
+  const minutes = now.getMinutes();
+  const seconds = now.getSeconds();
+
+  if (minutes % 5 === 0 && seconds < 5) {
+    if (Date.now() - lastRestartTime > cooldownMs) {
+      console.log('⏰ Scheduled restart triggered.');
+      recordRestart({ scheduled: true });
+      lastRestartTime = Date.now();
+      process.exit(0);
+    }
+  }
+}, 1000);
+
+// ──────── SLASH COMMAND REGISTRATION ────────
+function registerSlashCommands() {
+  const commands = [{
+    name: 'uptime',
+    description: 'See how long the bot has been online.'
+  }];
+
+  const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
+  rest.put(Routes.applicationCommands(client.user.id), { body: commands }).then(() => {
+    console.log('✅ Slash commands registered.');
+  }).catch(console.error);
+}
+
+// ──────── SLASH COMMAND HANDLER ────────
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName === 'uptime') {
+    const durationMs = Date.now() - startupTime;
+    const duration = formatDuration(durationMs);
+
+    const embed = new EmbedBuilder()
+      .setTitle('🤖 Uptime Report')
+      .setColor('Green')
+      .addFields(
+        { name: 'Bot', value: `${client.user.tag}`, inline: true },
+        { name: 'Creator(s)', value: DEV_USER_IDS.map(id => `<@${id}>`).join(', '), inline: true },
+        { name: 'Uptime', value: duration, inline: true }
+      )
+      .setTimestamp();
+
+    await interaction.reply({ embeds: [embed] });
+  }
+});
+
+// ──────── UTILITY ────────
+function formatDuration(ms) {
+  const seconds = Math.floor(ms / 1000) % 60;
+  const minutes = Math.floor(ms / (1000 * 60)) % 60;
+  const hours = Math.floor(ms / (1000 * 60 * 60)) % 24;
+  const days = Math.floor(ms / (1000 * 60 * 60 * 24));
+
+  return `${days}d ${hours}h ${minutes}m ${seconds}s`;
+}
+
+client.login(process.env.TOKEN).then(() => {
+  setTimeout(restoreRestartMessage, 5000);
+});
