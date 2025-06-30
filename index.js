@@ -129,21 +129,27 @@ client.on('messageCreate', async (message) => {
 
   if (value === null) return; // Ignore non-parsable
 
-  // Check same user twice
-  if (userId === data.lastUserId) {
+  // ✅ Same user twice in a row (only matters if continuing correctly)
+  if (data.lastUserId === userId && value === data.lastNumber + 1) {
     await message.react('❌');
-    await message.channel.send(`❌ <@${userId}> messed it up, you can’t say a number 2 times in a row. ❌`);
+    await message.channel.send(`❌ <@${userId}> messed it up, you can’t say a number 2 times in a row. Count has been reset to 1! ❌`);
+    
+    // RESET
+    saveData({ lastNumber: 0, lastUserId: null });
     return;
   }
 
-  // Check correct next number
+  // ✅ Wrong next number
   if (value !== data.lastNumber + 1) {
     await message.react('❌');
-    await message.channel.send(`❌ <@${userId}> messed it up, try again! ❌`);
+    await message.channel.send(`❌ <@${userId}> messed it up, try again! Count has been reset to 1! ❌`);
+    
+    // RESET
+    saveData({ lastNumber: 0, lastUserId: null });
     return;
   }
 
-  // Success
+  // ✅ Success
   data.lastNumber = value;
   data.lastUserId = userId;
   saveData(data);
@@ -151,5 +157,4 @@ client.on('messageCreate', async (message) => {
   await message.react('✅');
   console.log(`✅ Count advanced to ${value} by ${message.author.tag}`);
 });
-
 client.login(process.env.DISCORD_TOKEN);
