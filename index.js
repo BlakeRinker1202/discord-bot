@@ -138,6 +138,9 @@ client.on('messageCreate', async (message) => {
   if (value !== data.lastNumber + 1) {
     await message.react('❌');
     await message.channel.send(`❌ <@${userId}> messed it up, try again! ❌`);
+    
+    data.lastUserId = userId;
+    saveData(data);
     return;
   }
 
