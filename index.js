@@ -128,13 +128,15 @@ client.on('messageCreate', async (message) => {
   const value = parseCountMessage(message.content);
 
   if (value === null) return; 
-  
+
   if (userId === data.lastUserId) {
+    await message.react('❌');
     await message.channel.send(`❌ <@${userId}> messed it up, you can’t say a number 2 times in a row. ❌`);
     return;
   }
 
   if (value !== data.lastNumber + 1) {
+    await message.react('❌');
     await message.channel.send(`❌ <@${userId}> messed it up, try again! ❌`);
     return;
   }
@@ -143,6 +145,7 @@ client.on('messageCreate', async (message) => {
   data.lastUserId = userId;
   saveData(data);
 
+  await message.react('✅');
   console.log(`✅ Count advanced to ${value} by ${message.author.tag}`);
 });
 
