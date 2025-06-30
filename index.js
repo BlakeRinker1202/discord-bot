@@ -127,23 +127,23 @@ client.on('messageCreate', async (message) => {
 
   const value = parseCountMessage(message.content);
 
-  if (value === null) return; 
+  if (value === null) return; // Ignore non-parsable
 
+  // Check same user twice
   if (userId === data.lastUserId) {
     await message.react('❌');
     await message.channel.send(`❌ <@${userId}> messed it up, you can’t say a number 2 times in a row. ❌`);
     return;
   }
 
+  // Check correct next number
   if (value !== data.lastNumber + 1) {
     await message.react('❌');
     await message.channel.send(`❌ <@${userId}> messed it up, try again! ❌`);
-    
-    data.lastUserId = userId;
-    saveData(data);
     return;
   }
 
+  // Success
   data.lastNumber = value;
   data.lastUserId = userId;
   saveData(data);
