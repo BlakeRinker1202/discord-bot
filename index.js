@@ -15,7 +15,7 @@ app.listen(PORT, () => {
   console.log(`🌐 Express server listening on port ${PORT}`);
 });
 
-const CHANNEL_ID = '1383145257700425728';
+const CHANNEL_ID = '1387399227050823700';
 const DATA_PATH = path.join(__dirname, 'data', 'countData.json');
 
 function loadData() {
